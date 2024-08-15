@@ -1,10 +1,6 @@
-
+# python3 server.py --host=10.100.30.240 --port=1222 --tensor-parallel-size=1 --model=lightblue/suzume-llama-3-8B-multilingual --gpu-memory-utilization=0.3 --disable-log-requests
 # !pip install flash-attn --no-build-isolation
-
-
-# In[8]:
-
-
+import gc
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from copy import deepcopy
@@ -18,11 +14,45 @@ from functools import partial
 import os
 import logging
 from aiostream import stream
-
+import pynvml
 
 logging.basicConfig(level=logging.WARNING)
+# pynvml.nvmlInit()
 
 # In[9]:
+
+def clear_cuda_cache_for_all_gpus():
+    # Store the current device context before switching
+    previous_device = torch.cuda.current_device()
+
+    # Get the total number of GPUs available
+    num_gpus = torch.cuda.device_count()
+
+    # Iterate over each GPU
+    for gpu_idx in range(num_gpus):
+        # Set the current device context to the GPU
+        torch.cuda.set_device(gpu_idx)
+
+        # Attempt to clear the cache for the current device
+        torch.cuda.empty_cache()
+
+        # Optionally, perform additional cleanup tasks here
+
+    # Switch back to CPU or another GPU if necessary
+    torch.cuda.set_device(previous_device)
+
+def print_gpu_memory_usage():
+    handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # Change the index if you have multiple GPUs
+    info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    print(f"Total memory: {info.total / 1024**2:.2f} MB")
+    print(f"Free memory: {info.free / 1024**2:.2f} MB")
+    print(f"Used memory: {info.used / 1024**2:.2f} MB")
+
+def print_torch_memory_usage():
+    allocated = torch.cuda.memory_allocated(0) / 1024**2
+    reserved = torch.cuda.memory_reserved(0) / 1024**2
+    print(f"PyTorch allocated memory: {allocated:.2f} MB")
+    print(f"PyTorch reserved memory: {reserved:.2f} MB")
 
 
 class Node:
@@ -97,20 +127,25 @@ class Node:
 # In[10]:
 
 
-from vllm.sampling_params import SamplingParams
+from vllm import SamplingParams
+from numba import jit
+
 
 class SubstringEngine:
-    def __init__(self, llm, tokenizer, mode=False):
+    def __init__(self, llm, tokenizer, mode=False, is_fast=True):
         self.llm = llm
         self.tokenizer = tokenizer
         self.max_token_len = min(len(sorted(list(self.tokenizer.vocab.keys()),
                                         key=lambda x: len(x), reverse=True)[0]),
                                  16)
         self.mode = mode
-
+        self.is_fast = is_fast
+        self.for_loop_counter = 0
+        self.inference_calls = 0
+        
     def _expand_tree(self, parent: Node,
                     tokenized_candidates: List[torch.Tensor],
-                    height: int,
+                    max_depth: int,
                     position: int = 0,
                     special_ids: List[int] = []) -> Node:
         """
@@ -119,31 +154,39 @@ class SubstringEngine:
         Args:
             parent (Node): The parent node from which to expand the tree.
             tokenized_candidates (List[torch.Tensor]): The tokenized context for the prompt.
-            height (int): The height of the tree to expand to.
+            max_depth (int): Limit on the depth of the constructed tree
             position (int, optional): The current position in the tokenized context. Defaults to 0.
             special_ids (List[int], optional): A list of special token IDs to exclude from the tree. Defaults to an empty list.
     
         Returns:
             Node: The parent node with its children expanded.
         """
-
-        # Iterate over each context in the tokenized context
-        for candidate in tokenized_candidates:
-            # Get the token at the current position
-            if position < len(candidate):
-                token = candidate[position].item()
-                # Check if the token is not a special token and if it's not already a child of the parent
-                if (torch.equal(candidate[:position], parent.token_sequence) and 
-                    all(token != child.token_id for child in parent.children) and
-                    token not in special_ids):
-                    
-                    # Create a new node with the current token and add it as a child to the parent
-                    new_node = Node(token, parent, parent.depth + 1)
-                    parent.children.append(new_node)
+        if position >= max_depth:
+            return
         
-                    # Recursively expand the tree if the current position is less than the height
-                    if new_node.depth < height:
-                        self._expand_tree(new_node, tokenized_candidates, height, position + 1, special_ids)
+        tokenized_candidates_to_expand = tokenized_candidates.copy()
+        # Iterate over each context in the tokenized context
+        self.for_loop_counter += 1
+        for idx in range(len(tokenized_candidates)-1, -1, -1):
+            candidate = tokenized_candidates[idx]
+            # Get the token at the current position
+            token = candidate[position].item()
+            # Check if the token is not a special token and if it's not already a child of the parent
+            if (torch.equal(candidate[:position], parent.token_sequence) and 
+                all(token != child.token_id for child in parent.children) and
+                token not in special_ids):
+                
+                # Create a new node with the current token and add it as a child to the parent
+                new_node = Node(token, parent, parent.depth + 1)
+                parent.children.append(new_node)
+    
+                # Recursively expand the tree if the current position is less than the max_depth
+                if new_node.depth < max_depth:
+                    self._expand_tree(new_node, tokenized_candidates_to_expand, max_depth, position + 1, special_ids)
+            else:
+                tokenized_candidates_to_expand.pop(idx)
+            
+
         # Return the parent node with its children expanded
         return parent
 
@@ -164,16 +207,15 @@ class SubstringEngine:
         # Initialize the root node and tokenize the prompt
         root = Node(-1, None, 0)
         # Expand the tree from the root node to the specified height, excluding special tokens
-        s = time.time()
         root = self._expand_tree(root,
                            tokenized_context,
                            len(tokenized_context[0]),
                            special_ids = self.tokenizer.all_special_ids)
-        print(f"{time.time() - s} sec: expand tree recursive call")
         # Set the cumulative log probability of the root node to 0
         root.cum_log_probability = 0
-        
+
         if self.mode:
+            print(f"{self.for_loop_counter} - self.for_loop_counter")
             print(f"build tree for first tokens: {time.time() - s}")
         
         # Return the root node and the tokenized prompt
@@ -207,10 +249,22 @@ class SubstringEngine:
         restriction = min(len(context) + 1, max_token_length)
         # Initialize an empty set to store unique substring candidates
         substring_candidates = set()
-        # Iterate over the text to generate all possible substrings within the restriction
-        for i in range(len(context)):
-            for j in range(i+1, i+1+restriction):
-                substring_candidates.add(context[i:j])
+
+        if self.is_fast:
+            substring_context = context.split(' ')
+            word_lengths = [len(word) for word in substring_context]
+            avg_length = (sum(word_lengths) + len(word_lengths))/len(word_lengths)
+            step_size = int(restriction // avg_length) + 1
+
+            # Iterate over the text to generate all possible substrings within the restriction
+            for i in range(len(substring_context)):
+                for j in range(i+1, min(len(substring_context) + 1, i + 1 + step_size)):
+                    candidate = " ".join(substring_context[i:j])
+                    substring_candidates.add(candidate)
+        else:
+            for i in range(len(context)):
+                for j in range(i+1, min(len(context)+1, i+1+restriction)):
+                    substring_candidates.add(context[i:j])
         
         # Sort the set of substring candidates for reproducibility
         substring_candidates = sorted(substring_candidates)
@@ -219,10 +273,98 @@ class SubstringEngine:
 
         if self.mode:
             print(f"get candidates: last 2 tokens + all substring candidates {time.time() - s}")
+            sequences
             
         return sequences
-
     
+
+    async def _fast_logprobs(self, common_part, tokenized_candidates, k):   
+        sampling_params = SamplingParams(max_tokens=1,
+                                         prompt_logprobs=1,)
+        inference_counter = 0
+        input_prompts = {}
+        results = None
+
+        for candidate in tokenized_candidates:
+            candidate_length = torch.sum(candidate != self.tokenizer.pad_token_id, dim=-1)
+            prompt_token_ids = common_part + candidate.tolist()[:candidate_length]
+            input_prompts[tuple(prompt_token_ids)] = candidate.tolist()[:candidate_length]
+
+        s2 = time.time()
+
+        for input_prompt in input_prompts.keys():
+            request_id = random_uuid()
+
+            tokens_prompt: TokensPrompt = {
+                'prompt_token_ids': list(input_prompt),
+                'multi_modal_data': None 
+            }
+
+            # Feed the input into the model to get the logits
+            res = (engine.generate(request_id=request_id,
+                                   inputs=tokens_prompt,
+                                   sampling_params=sampling_params)
+                  )
+            inference_counter += 1
+            clear_cuda_cache_for_all_gpus()
+            gc.collect()
+
+            if not results:
+                results = res
+            else:
+                results = stream.merge(results, res)
+
+        results = [item async for item in results]
+
+        self.inference_calls += 1
+        s2e = time.time()
+
+        if self.mode:
+            print(f"inference counter: {inference_counter}")
+            print(f"\nawait for model response: {s2e - s2}\n")
+            print(f"inference_counter/time: {inference_counter/(s2e - s2)}")
+            print(f"inference number: {self.inference_calls}")
+
+        candidate_log_prob_map = {}
+
+        for result in results:
+            prompt_token_ids = result.prompt_token_ids
+            candidate = input_prompts[tuple(prompt_token_ids)]
+            cum_log_prob = 0
+            for token_id, log_prob in zip(candidate, result.prompt_logprobs[-len(candidate):]):
+                if self.mode:
+                    print(f"{self.tokenizer.decode(token_id)} : {log_prob[token_id].logprob}")
+                cum_log_prob += log_prob[token_id].logprob
+
+            if self.mode:
+                print()
+            candidate_log_prob_map[tuple(candidate)] = cum_log_prob 
+
+        
+        # Calculate the normalized scores for each node
+        scores = []
+        for candidate in tokenized_candidates:
+            candidate_length = torch.sum(candidate != self.tokenizer.pad_token_id, dim=-1)
+            cum_log_probability = candidate_log_prob_map[tuple(candidate.tolist()[:candidate_length])]
+            scores.append(cum_log_probability / candidate_length)
+            if self.mode:
+                print(self.tokenizer.decode(candidate[:candidate_length]))
+                print(scores[-1])
+                print()
+        
+        scores = torch.tensor(scores)
+
+        # Determine the indices of the top k scores
+        top_k_indices = torch.topk(scores, k=k, largest=True, sorted=True).indices
+
+        del scores
+        del input_prompts
+        del results
+        del candidate_log_prob_map
+
+        return [tokenized_candidates[i] for i in top_k_indices]
+
+
     async def _compute_logprob(self, common_part, nodes):
         """
         Computes the cumulative log probabilities for each node in the tree structure,
@@ -264,7 +406,7 @@ class SubstringEngine:
         s = time.time()
         
         # Calculate the number of tokens in the common part of the text
-        
+        inference_counter = 0
         log_probs_mapping = {}
         node_output_map = {}
         nodes_map = []
@@ -273,49 +415,79 @@ class SubstringEngine:
                                          prompt_logprobs=1,
                                          logits_processors=[process_log_probs])
 
-        nodes_map = [node for node in nodes if node.cum_log_probability is None]
+        nodes_map = set(node for node in nodes if node.cum_log_probability is None)
 
-        if self.mode:
-            print("log prob nodes: ")
-            print(len(nodes_map))
-            for node in nodes_map:
-                print(self.tokenizer.decode(node.token_sequence))
-            print()
+        parents_without_logprob = set()
+        for node in nodes_map:
+            parent_tmp = node.parent_node
+            while parent_tmp.cum_log_probability is None:
+                if parent_tmp not in nodes_map:
+                    parents_without_logprob.add(parent_tmp)
+                parent_tmp = parent_tmp.parent_node
+
+        nodes_map = list(nodes_map) + list(parents_without_logprob)
 
         if not nodes_map:
             return
         
+        s1 = time.time()
         common_part_encoded = self.tokenizer.encode(common_part) 
         inputs_map = {}
         for node in nodes_map:
             inp = common_part_encoded + node.parent_node.token_sequence.tolist()
             inputs_map.setdefault(tuple(inp), []).append(node)
-
+        
+        if self.mode:
+            print(f"\ncreate inputs map: {time.time() - s1}\n")
             
-        # # Iterate over each node
-        # # for node in nodes:        
+         
+        s2 = time.time()    
         for input_prompt in inputs_map:
             request_id = random_uuid()
+
+            # Feed the input into the model to get the logits
+
+            tokens_prompt: TokensPrompt = {
+                'prompt_token_ids': list(input_prompt),
+                'multi_modal_data': None  # If you have multi-modal data, provide it here
+            }
+
             # Feed the input into the model to get the logits
             res = (engine.generate(request_id=request_id,
-                                   prompt=None,
-                                   prompt_token_ids=list(input_prompt),
+                                   inputs=tokens_prompt,
                                    sampling_params=sampling_params)
                   )
-            
+            inference_counter += 1            
             
             if not results:
                 results = res
             else:
                 results = stream.merge(results, res)
 
-        async for item in results:
-            if self.mode:
-                print("all async generations are done")
+        _ = [_ async for _ in results]
+
+        s2e = time.time()
+        self.inference_calls += 1
+        print(f"inference counter: {inference_counter}")
+        print(f"\nawait for model response: {s2e - s2}\n")
+        print(f"inference_counter/time: {inference_counter/(s2e - s2)}")
+        print(f"inference number: {self.inference_calls}")
+
+
+        if self.mode:
+            print(f"inference counter: {inference_counter}")
+            print(f"\nawait for model response: {s2e - s2}\n")
+            print(f"inference_counter/time: {inference_counter/(s2e - s2)}")
+
+        s3 = time.time()
         
         for input_prompt in inputs_map:
             for node in inputs_map[input_prompt]:
                 node_output_map[node] = log_probs_mapping[input_prompt][node.token_id]
+
+        if self.mode:
+            print(f"save log probs: {time.time() - s3}")
+        
                 
         # Iterate over the nodes again to update their cumulative log probabilities
         for node in node_output_map:
@@ -326,58 +498,46 @@ class SubstringEngine:
                 print(node.token_id)
                 print(node_log_prob)
                 
-            # It is possible, that parent node cum_log_probability is not calculated yet
-            # Thus, if it is a such situation, we will calculate log_probability for parent nodes also
-            
-            # Initialize lists for the parent nodes and their log probabilities
-            parents_log_probs = []
-            parents_sequence_without_logprob = []
-            # Iterate over the parent nodes
-            parent_tmp = node.parent_node
-         
+            if node.parent_node.cum_log_probability is None:
                 
-            i = 2            
-            while parent_tmp.cum_log_probability is None:
-                parents_sequence_without_logprob.append(parent_tmp)
-                
-                key = common_part_encoded + parent_tmp.parent_node.token_sequence.tolist()
-                parent_logprobs = log_probs_mapping.get(tuple(key), None)
-                if parent_logprobs is None:
+                parents_sequence_without_logprob = []
+                parent_tmp = node.parent_node
+                while parent_tmp.cum_log_probability is None:
+                    parents_sequence_without_logprob.append(parent_tmp)
+                    parent_tmp = parent_tmp.parent_node
 
-                    request_id = random_uuid()
-                    res = engine.generate(request_id=request_id,
-                                        prompt=None,
-                                        prompt_token_ids=key,
-                                        sampling_params=sampling_params)
-                        
-                    async for item in res:
-                        if self.mode:
-                            print("parent async generation is done to get logprobs")
-                    
+                parents_log_probs = []
+
+                for parent_tmp in parents_sequence_without_logprob:
+                    key = common_part_encoded + parent_tmp.parent_node.token_sequence.tolist()
                     parent_logprob = log_probs_mapping[tuple(key)][parent_tmp.token_id]
                     parents_log_probs.append(parent_logprob)
-                else:
-                    parents_log_probs.append(parent_logprobs[parent_tmp.token_id])
-
-                i += 1
-                if self.mode:
-                    print("parent without logprob: ")
-                    print(parent_tmp.token_id)
-                    print(parents_log_probs[-1])
-
-                parent_tmp = parent_tmp.parent_node
             
-            # Calculate the cumulative log probability for each parent node
-            number_of_parents_without_logbrob = len(parents_sequence_without_logprob)
-            for n_id in range(number_of_parents_without_logbrob - 1, -1, -1):
-                parents_sequence_without_logprob[n_id].cum_log_probability = (parents_log_probs[n_id] + 
-                                                        parents_sequence_without_logprob[n_id].parent_node.cum_log_probability)
-            
+                    if self.mode:
+                        print("parent without logprob: ")
+                        print(parent_tmp.token_id)
+                        print(parents_log_probs[-1])
+
+
+                # Calculate the cumulative log probability for each parent node
+                number_of_parents_without_logbrob = len(parents_sequence_without_logprob)
+                for n_id in range(number_of_parents_without_logbrob - 1, -1, -1):
+                    parents_sequence_without_logprob[n_id].cum_log_probability = (parents_log_probs[n_id] + 
+                                                            parents_sequence_without_logprob[n_id].parent_node.cum_log_probability)
+                
+
             # Update the node's cumulative log probability
             node.cum_log_probability = node.parent_node.cum_log_probability + node_log_prob
 
         if self.mode:
+            print("log prob nodes: ")
+            print(len(nodes_map))
+            for node in nodes_map:
+                print(f"'{self.tokenizer.decode(node.token_sequence)}'; '{node.cum_log_probability}'; '{node.depth}'")
+            
+            print()
             print(f"compute log_probs call {time.time() - s}")
+            
             
     
     async def _get_topk_nodes(self, nodes, k):
@@ -445,22 +605,41 @@ class SubstringEngine:
         restriction = min(len(context) + 1, max_candidate_length)
         # Initialize an empty set to store unique substring candidates
         substring_candidates = set()
+    
         # Iterate over the text to generate all possible substrings within the restriction
-        for i in range(len(context)):
-            for j in range(i+1, i+1+restriction):
-                candidate = prompt + context[i:j]
-                tokenized_candidate = self.tokenizer.encode(candidate,
-                                                       return_tensors="pt",
-                                                      add_special_tokens=False)[0]
-                # Check if the candidate starts with one of the chosen options
-                if any(torch.equal(tokenized_candidate[:len(option)], option) for option in chosen_options):
-                    substring_candidates.add(candidate)
+
+        if self.is_fast:
+            substring_context = context.split(' ')
+            word_lengths = [len(word) for word in substring_context]
+            avg_length = (sum(word_lengths) + len(word_lengths))/len(word_lengths)
+            step_size = int(restriction // avg_length) + 1
+
+            for i in range(len(substring_context)):
+                for j in range(i+1, min(len(substring_context)+1, i+1+step_size)):
+                    candidate = prompt + " ".join(substring_context[i:j])
+                    tokenized_candidate = self.tokenizer.encode(candidate,
+                                                        return_tensors="pt",
+                                                        add_special_tokens=False)[0]
+                    # Check if the candidate starts with one of the chosen options
+                    if any(torch.equal(tokenized_candidate[:len(option)], option) for option in chosen_options):
+                        substring_candidates.add(candidate)
+        else:
+            for i in range(len(context)):
+                for j in range(i+1, i+1+restriction):
+                    candidate = prompt + context[i:j]
+                    tokenized_candidate = self.tokenizer.encode(candidate,
+                                                        return_tensors="pt",
+                                                        add_special_tokens=False)[0]
+                    # Check if the candidate starts with one of the chosen options
+                    if any(torch.equal(tokenized_candidate[:len(option)], option) for option in chosen_options):
+                        substring_candidates.add(candidate)
         
         # Sort the set of substring candidates for reproducibility
         sequences = sorted(list(substring_candidates))
 
         if self.mode:
             print(f"get expanded candidates starts with top k first tokens: {time.time() - s}")
+            
         return sequences
 
     
@@ -483,16 +662,18 @@ class SubstringEngine:
         this branching. This node is the one just before the branching point, and it can be used for further 
         processing or analysis.
         """
+        nodes_sequence = [node]
         while True:
             children = node.children
             # If the node has exactly one child, move to that child
             if len(children) == 1:
                 node = children[0]
+                nodes_sequence.append(node)
             else:
                 # If the node has more than one child, it's a branching point
                 break
         # Return the node just before the branching point
-        return node
+        return nodes_sequence
 
 
     async def _iteration(self, working_list, common_part, k):
@@ -533,14 +714,14 @@ class SubstringEngine:
         s = time.time()
         for node in working_list:
             for c in node.children:
-                candidate_to_add = self._get_nodes_seq_before_branch(c)
-                if candidate_to_add not in working_list:
-                    working_list.append(candidate_to_add)
+                candidate_seq_to_add = self._get_nodes_seq_before_branch(c)
+                if candidate_seq_to_add[-1] not in working_list:
+                    working_list.extend(candidate_seq_to_add)
 
         if self.mode:
             print(f"add children sequences before found branch into working list: {time.time() - s}")
         return working_list
-
+    
     
     async def substring(self, prompt, context, k, max_substring_length, return_full_text=False):
         """
@@ -555,6 +736,11 @@ class SubstringEngine:
         Returns:
             Tuple[List[Node], Node]: The top `k` nodes from the working list and the initial root node of the tree.
         """
+        # print("Calling Substring:")
+        # print_gpu_memory_usage()
+        # print_torch_memory_usage()
+        # print()
+
         # Tokenize the prompt and extract the last part and the common part
         tokenized_prompt = self.tokenizer(prompt,
                                     return_tensors="pt",
@@ -568,109 +754,133 @@ class SubstringEngine:
                 return prompt + context
             return context
         
+
         # Generate candidate sequences from the context
         substring_candidates = self._candidate_sequences(context, self.max_token_len, last_part)
-        s = time.time()
+        
         tokenized_s_cand = self.tokenizer(substring_candidates,
                                      return_tensors="pt",
                                      padding=True,
                                      add_special_tokens=False)['input_ids']
-        print(f"{time.time() - s} tokenization")
-        # Build the tree structure from the tokenized candidate sequences
-        initial_root = self._build_tree(tokenized_s_cand)
+        # print("After getting ")
+        # print_gpu_memory_usage()
+        # print_torch_memory_usage()
 
-        # Expand the tree from the root node
-        node_before_branch = self._get_nodes_seq_before_branch(initial_root)
-        first_branch_children = node_before_branch.children
-        
-        if not first_branch_children:
-            first_branch_children = [node_before_branch]
+        if not self.is_fast:
+            tokenized_s_cand = list(tokenized_s_cand)
+            # Build the tree structure from the tokenized candidate sequences
+            initial_root = self._build_tree(tokenized_s_cand)
+
+            # Expand the tree from the root node
+            node_before_branch = self._get_nodes_seq_before_branch(initial_root)[-1]
+            first_branch_children = node_before_branch.children
             
-        # Last token of the prompt can be changed
-        # Therefore, we have to capture not tokens before first branch, but all its children after branch    
-        
-        working_list = []
-        for node in first_branch_children:
-            wl_len = len(working_list)
+            if not first_branch_children:
+                first_branch_children = [node_before_branch]
+                
+            # Last token of the prompt can be changed
+            # Therefore, we have to capture not tokens before first branch, but all its children after branch    
             
-            for c in node.children:
-                candidate_to_add = self._get_nodes_seq_before_branch(c)
-                if candidate_to_add not in working_list:
-                    working_list.append(candidate_to_add)  
+            working_list = []
+            for node in first_branch_children:
+                wl_len = len(working_list)
+                
+                for c in node.children:
+                    candidate_seq_to_add = self._get_nodes_seq_before_branch(c)
+                    if candidate_seq_to_add[-1] not in working_list:
+                        working_list.extend(candidate_seq_to_add)  
+                        
+                if wl_len == len(working_list):
+                    working_list.append(node)
+
                     
-            if wl_len == len(working_list):
-                working_list.append(node)
-                   
-        await self._compute_logprob(common_part, working_list)
-        working_list = await self._get_topk_nodes(working_list, k)
-    
-        # Generate expanded candidate sequences based on the chosen candidates
-        chosen_candidates = list(map(lambda x: x.token_sequence, working_list))
+            await self._compute_logprob(common_part, working_list)
+            working_list = await self._get_topk_nodes(working_list, k)
 
-        if self.mode:
-            print("chosen_candidates for explansion: ")
-            for c in chosen_candidates:
-                print(self.tokenizer.decode(c))
-            print()
+            # print_gpu_memory_usage()
+            # print_torch_memory_usage()
         
-        expanded_candidates = self._candidate_sequences_exp(context, chosen_candidates, max_substring_length, last_part)
-        
-        tokenized_expanded_candidates = self.tokenizer(expanded_candidates,
-                                                  return_tensors="pt",
-                                                  padding=True,
-                                                  add_special_tokens=False)['input_ids']
-    
-        # Update the working list with children nodes
-        working_list[0].parent_node.children = working_list
-    
-        # Expand the tree with the expanded candidate sequences
-        for node in working_list:
-            self._expand_tree(node,
-                        tokenized_expanded_candidates,
-                        len(tokenized_expanded_candidates[0]),
-                        position = node.depth,
-                        special_ids=self.tokenizer.all_special_ids)
-    
-        # Iteratively refine the set of candidate sequences based on their likelihood
-        while True:
-            prev_w_l = deepcopy(working_list)
-            working_list = await self._iteration(working_list, common_part, k)
-            if prev_w_l == working_list:
-                break
-    
-        res_text = []
-        for node in working_list:
-            substirng_choice = self.tokenizer.decode(node.token_sequence)
+            # Generate expanded candidate sequences based on the chosen candidates
+            chosen_candidates = list(map(lambda x: x.token_sequence, working_list))
+
+            if self.mode:
+                print("chosen_candidates for explansion: ")
+                for c in chosen_candidates:
+                    print(self.tokenizer.decode(c))
+                print()
             
-            if return_full_text:
-                res_text.append(common_part + substirng_choice)
+            expanded_candidates = self._candidate_sequences_exp(context, chosen_candidates, max_substring_length, last_part)
+            
+            tokenized_expanded_candidates = list(self.tokenizer(expanded_candidates,
+                                                    return_tensors="pt",
+                                                    padding=True,
+                                                    add_special_tokens=False)['input_ids'])
+        
+            # Update the working list with children nodes
+            working_list[0].parent_node.children = working_list
+        
+            # Expand the tree with the expanded candidate sequences
+            for node in working_list:
+                self._expand_tree(node,
+                            tokenized_expanded_candidates,
+                            len(tokenized_expanded_candidates[0]),
+                            position = node.depth,
+                            special_ids=self.tokenizer.all_special_ids)
+        
+            # Iteratively refine the set of candidate sequences based on their likelihood
+            while True:
+                prev_w_l = deepcopy(working_list)
+                # print_gpu_memory_usage()
+                # print_torch_memory_usage()
+                working_list = await self._iteration(working_list, common_part, k)
+                # print_gpu_memory_usage()
+                # print_torch_memory_usage()
+                if prev_w_l == working_list:
+                    break
+        
+            res_text = []
+            for node in working_list:
+                substirng_choice = self.tokenizer.decode(node.token_sequence)
+                
+                if return_full_text:
+                    res_text.append(common_part + substirng_choice)
+                else:
+                    res_text.append(substirng_choice[len(last_part):])
+            
+            return res_text, working_list, initial_root
+
+        common_part_encoded = self.tokenizer.encode(common_part) 
+        # print("AFTER ENCODING")
+        # print_gpu_memory_usage()
+        # print_torch_memory_usage()
+        # print()
+        chosed_options = await self._fast_logprobs(common_part_encoded, tokenized_s_cand, k)
+
+        del common_part_encoded
+        del tokenized_s_cand
+        del substring_candidates
+        del tokenized_prompt
+
+
+        gc.collect()
+
+        # print("After compute logprob call")
+        # print_gpu_memory_usage()
+        # print_torch_memory_usage()
+        # print()
+        res_text = []
+        for option in chosed_options:
+            substirng_choice = self.tokenizer.decode(option, skip_special_tokens=True)
+            if return_full_text: 
+                    res_text.append(common_part + substirng_choice)
             else:
                 res_text.append(substirng_choice[len(last_part):])
         
-        return res_text, working_list, initial_root
-
-
-# In[11]:
-
-
-from transformers import StoppingCriteria
-
-class EosListStoppingCriteria(StoppingCriteria):
-    def __init__(self, eos_sequence, len_tokenized_eos_sequence, tokenizer):
-        self.eos_sequence = eos_sequence
-        self.len_tokenized_eos_sequence = len_tokenized_eos_sequence
-        self.tokenizer = tokenizer
-
-    def __call__(self,
-                 input_ids: torch.LongTensor,
-                 scores: torch.FloatTensor,
-                 **kwargs) -> bool:
+        del last_part
+        del common_part
         
-        # Check each batch item if the sequence ends with the specified eos_sequence
-        last_ids = self.tokenizer.decode(input_ids[:,-self.len_tokenized_eos_sequence:])
-        # Check if all elements in eos_sequence match for any item in the batch
-        return self.eos_sequence == last_ids
-
+        return res_text, [], None
+        
 
 # In[12]:
 
@@ -692,14 +902,14 @@ class GuidanceBeta:
 
     def __init__(self,
                  llm,
-                 mode=True, ):
+                 mode=True,
+                 is_fast=True):
         
         self.llm = llm
-        
-        if hasattr(llm, "get_tokenizer"):
+        if hasattr(self.llm, "get_tokenizer"):
             self.tokenizer = self.llm.get_tokenizer()
-        elif hasattr(llm, "tokenizer"):
-            if hasattr(llm.tokenizer, "tokenizer"):
+        elif hasattr(self.llm, "tokenizer"):
+            if hasattr(self.llm.tokenizer, "tokenizer"):
                 self.tokenizer = self.llm.tokenizer.tokenizer
             else:
                 self.tokenizer = self.llm.tokenizer
@@ -710,108 +920,19 @@ class GuidanceBeta:
             )
 
         if not self.tokenizer.pad_token:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.tokenizer.pad_token = self.tokenizer.eos_token
             
         self.mode = mode
+        self.is_fast = is_fast
 
     async def substring(self, input_text, context:str, k=1, max_substring_length=35):
-        substring_engine = SubstringEngine(self.llm, self.tokenizer, mode=self.mode)
+        substring_engine = SubstringEngine(self.llm, self.tokenizer, mode=self.mode, is_fast=self.is_fast)
         # return res_text, working_list, initial_root
         result = await substring_engine.substring(input_text, context, k, max_substring_length)
-        
+        del substring_engine
         return result[0]
 
 
-# In[13]:
-
-
-# import time
-
-# import os
-# import torch
-# from vllm import LLM
-
-# model_name = "meta-llama/Meta-Llama-3-8B"
-# access_token = "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"
-
-
-# Specify the primary GPU to use (GPU 0, which has more available memory)
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
-
-# Setting PyTorch environment variable for better memory management
-# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
-
-# llm = LLM(
-#     model=model_name,
-#     tensor_parallel_size=1,  # Consider adjusting if still facing issues
-#     gpu_memory_utilization=0.7,
-#     enforce_eager=True
-# )
-
-
-# In[ ]:
-
-
-# guidance_system = GuidanceBeta(llm, mode=False)
-
-
-# Сейчас на сабстринге включены принты, чтобы следить за временем каждого этапа алогоритма.
-# Если хочешь выключить, то передай в инициализацию GuidanceBeta аргумент `mode=False`
-
-# In[ ]:
-
-
-# import time
-
-# prompt = "How many parameters does BLOOM have? "
-# context = "NL"
-
-# s = time.time()
-# res = guidance_system.substring(prompt, context, 3)
-# time.time() - s
-
-
-# In[ ]:
-
-
-
-
-
-# In[ ]:
-
-
-# for node in res[1]:
-#     print(node)
-#     print(guidance_system.tokenizer.decode(node.token_sequence))
-
-
-
-#  _______________________________
-# / Don't want to self-host?      \
-# \ Try .json at http://dottxt.co /
-#  -------------------------------
-#        \   ^__^
-#         \  (oo)\_______
-#            (__)\       )\/\
-#                ||----w |
-#                ||     ||
-#
-#
-# Copyright 2024- the Outlines developers
-# Copyright 2023 the vLLM developers
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-
-#     http://www.apache.org/licenses/LICENSE-2.0
-
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import argparse
 import json
 from typing import AsyncGenerator,Optional
@@ -819,6 +940,7 @@ import outlines
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.encoders import jsonable_encoder
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.sampling_params import SamplingParams
@@ -884,7 +1006,11 @@ async def generate(request: Request) -> Response:
         else:
             logits_processors = []
         sampling_params = SamplingParams(
-            **request_dict, logits_processors=logits_processors,stop = stop,include_stop_str_in_output=True, temperature=temperature  # type: ignore
+            **request_dict, 
+            logits_processors=logits_processors,
+            stop = stop,
+            include_stop_str_in_output=False, 
+            temperature=temperature  # type: ignore
         )
         request_id = random_uuid()
         
@@ -911,12 +1037,18 @@ async def generate(request: Request) -> Response:
             final_output = request_output
         
         assert final_output is not None
-        prompt = final_output.prompt
-        text_outputs = [output.text for output in final_output.outputs]
-        return JSONResponse(text_outputs)
+        print(f"RES {[output.text for output in final_output.outputs]}")
+        return JSONResponse(content=[output.text for output in final_output.outputs][0])
     else:
-        res = await guidance_system.substring(prompt, substring, 1)
-        return JSONResponse(res)
+        try:
+            res = await guidance_system.substring(prompt, substring, 1)
+            return JSONResponse(res[0])
+        except RuntimeError as e:
+            if 'CUDA error: out of memory' in str(e):
+                # Handle the error, for example by freeing up some memory
+                clear_cuda_cache_for_all_gpus()
+                gc.collect()
+                return "Caught CUDA out of memory error. Try Again"
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -933,7 +1065,7 @@ if __name__ == "__main__":
 
     # Sets default for the model (`facebook/opt-125m`)
     engine = AsyncLLMEngine.from_engine_args(engine_args)
-    guidance_system = GuidanceBeta(engine.engine, mode=True)
+    guidance_system = GuidanceBeta(engine.engine, mode=False)
 
     uvicorn.run(
         app,
@@ -944,8 +1076,3 @@ if __name__ == "__main__":
         ssl_keyfile=args.ssl_keyfile,
         ssl_certfile=args.ssl_certfile,
     )
-
-
-
-
-
