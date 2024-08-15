@@ -22,11 +22,8 @@ class GuidanceBeta:
         tokenizer (AutoTokenizer): Tokenizer for tokenizing inputs.
     """
 
-    def __init__(self,
-                 llm,
-                 mode=True,
-                 is_fast=True):
-        
+    def __init__(self, llm, mode=True, is_fast=True):
+
         self.llm = llm
         self.llm_engine = self.llm.engine
         if hasattr(self.llm_engine, "get_tokenizer"):
@@ -39,12 +36,11 @@ class GuidanceBeta:
         else:
             raise ValueError(
                 "The provided LLM instance in RegexLogitsProcessor neither has a "
-                "`tokenizer` attribute or a get_tokenizer method."
-            )
+                "`tokenizer` attribute or a get_tokenizer method.")
 
         if not self.tokenizer.pad_token:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-            
+
         self.mode = mode
         self.is_fast = is_fast
 
@@ -54,7 +50,10 @@ class GuidanceBeta:
             for choice in choices:
                 inputs.append(f"{text}{choice}")
 
-        tokenized_inputs = self.tokenizer(inputs, return_tensors="pt", padding=True, add_special_tokens=True)
+        tokenized_inputs = self.tokenizer(inputs,
+                                          return_tensors="pt",
+                                          padding=True,
+                                          add_special_tokens=True)
 
         return tokenized_inputs
 
@@ -99,19 +98,24 @@ class GuidanceBeta:
             logits_slice_end = logits_slice_begin + number_of_options
 
             # Extracting logits for specific tokens
-            probabilities_slice = probabilities[logits_slice_begin:logits_slice_end, skip_logits - 1:-1, :]
+            probabilities_slice = probabilities[
+                logits_slice_begin:logits_slice_end, skip_logits - 1:-1, :]
 
             # Getting indices of tokens from input_ids
-            input_ids_slice = tokenized_inputs['input_ids'][logits_slice_begin:logits_slice_end, skip_logits:]
+            input_ids_slice = tokenized_inputs['input_ids'][
+                logits_slice_begin:logits_slice_end, skip_logits:]
 
             # Create a mask tensor in order not to count probability of special tokens
-            mask = torch.where(torch.isin(input_ids_slice, self.special_tokens), torch.tensor(0), torch.tensor(1))
+            mask = torch.where(
+                torch.isin(input_ids_slice, self.special_tokens),
+                torch.tensor(0), torch.tensor(1))
 
             # Adding a dimension to input_ids_slice
             input_ids_slice_expanded = input_ids_slice.unsqueeze(-1)
 
             # Gathering logits for the specified tokens
-            selected_probabilities = probabilities_slice.gather(dim=-1, index=input_ids_slice_expanded).squeeze(-1)
+            selected_probabilities = probabilities_slice.gather(
+                dim=-1, index=input_ids_slice_expanded).squeeze(-1)
             selected_probabilities_masked = selected_probabilities * mask
 
             # Getting log probabilities of
@@ -154,29 +158,45 @@ class GuidanceBeta:
             input_batches = [input_batches]
 
         # Tokenize all input batches at once
-        inputs = self.tokenizer(input_batches, return_tensors="pt", padding=True, add_special_tokens=True)
+        inputs = self.tokenizer(input_batches,
+                                return_tensors="pt",
+                                padding=True,
+                                add_special_tokens=True)
 
         inputs['input_ids'] = inputs['input_ids'].to('cuda')
 
         # Convert the stop_token to its token ID if provided
         if stop_keywords:
-            keyword_token_ids = self.tokenizer.encode(stop_keywords, add_special_tokens=False)
-            stopping_criteria = EosListStoppingCriteria(eos_sequence=keyword_token_ids)
+            keyword_token_ids = self.tokenizer.encode(stop_keywords,
+                                                      add_special_tokens=False)
+            stopping_criteria = EosListStoppingCriteria(
+                eos_sequence=keyword_token_ids)
             kwargs['stopping_criteria'] = [stopping_criteria]
 
         with torch.no_grad():
             # Generate text for all input batches in a single call
             generated_text = self.model.generate(inputs['input_ids'], **kwargs)
             # Decode the generated text
-            generated_texts = self.tokenizer.batch_decode(generated_text, skip_special_tokens=True)
+            generated_texts = self.tokenizer.batch_decode(
+                generated_text, skip_special_tokens=True)
 
         if not return_full_text:
-            return [result[len(batch):] for result, batch in zip(generated_texts, input_batches)]
+            return [
+                result[len(batch):]
+                for result, batch in zip(generated_texts, input_batches)
+            ]
         return generated_texts
 
-    def substring(self, input_text, context: str, k=1, max_substring_length=35):
-        substring_engine = SubstringEngine(self.model, self.tokenizer, mode=self.mode)
+    def substring(self,
+                  input_text,
+                  context: str,
+                  k=1,
+                  max_substring_length=35):
+        substring_engine = SubstringEngine(self.model,
+                                           self.tokenizer,
+                                           mode=self.mode)
         # return res_text, working_list, initial_root
-        result = substring_engine.substring(input_text, context, k, max_substring_length)
+        result = substring_engine.substring(input_text, context, k,
+                                            max_substring_length)
 
         return result

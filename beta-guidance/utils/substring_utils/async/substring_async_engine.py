@@ -11,22 +11,21 @@ from vllm.engine.async_llm_engine import AsyncLLMEngine
 
 
 class SubstringAsyncEngine:
-    def __init__(self,
-                 llm,
-                 tokenizer,
-                 mode=False, 
-                 is_fast=True):
+
+    def __init__(self, llm, tokenizer, mode=False, is_fast=True):
         self.llm = llm
         self.tokenizer = tokenizer
-        longest_token_in_vocab_len = len(sorted(list(self.tokenizer.vocab.keys()),
-                                                key=lambda x: len(x), reverse=True)[0])
-                                        
+        longest_token_in_vocab_len = len(
+            sorted(list(self.tokenizer.vocab.keys()),
+                   key=lambda x: len(x),
+                   reverse=True)[0])
+
         self.max_token_len = min(longest_token_in_vocab_len, 16)
         self.mode = mode
         self.is_fast = is_fast
         self.for_loop_counter = 0
 
-    def _expand_tree(self, 
+    def _expand_tree(self,
                      parent: Node,
                      tokenized_candidates: List[torch.Tensor],
                      max_depth: int,
@@ -54,47 +53,43 @@ class SubstringAsyncEngine:
         """
         if position >= max_depth:
             return
-        
+
         tokenized_candidates_to_expand = tokenized_candidates.copy()
         # Iterate over each context in the tokenized context
         self.for_loop_counter += 1
-        for idx in range(len(tokenized_candidates)-1, -1, -1):
+        for idx in range(len(tokenized_candidates) - 1, -1, -1):
             candidate = tokenized_candidates[idx]
             # Get the token at the current position
             token = candidate[position].item()
             # Check if the token is not a special token and if it's
             # not already a child of the parent
-            if (torch.equal(candidate[:position], parent.token_sequence) and 
-                all(token != child.token_id for child in parent.children) and
-                token not in special_ids):
-                
-                # Create a new node with the current token and add it 
+            if (torch.equal(candidate[:position], parent.token_sequence)
+                    and all(token != child.token_id
+                            for child in parent.children)
+                    and token not in special_ids):
+
+                # Create a new node with the current token and add it
                 # as a child to the parent
                 new_node = Node(token, parent, parent.depth + 1)
                 parent.children.append(new_node)
-    
+
                 # Recursively expand the tree if the current position
                 # is less than the max_depth
                 if new_node.depth < max_depth:
-                    self._expand_tree(new_node,
-                                      tokenized_candidates_to_expand, 
-                                      max_depth, 
-                                      position + 1, 
-                                      special_ids)
+                    self._expand_tree(new_node, tokenized_candidates_to_expand,
+                                      max_depth, position + 1, special_ids)
             else:
                 # Since the parent sequence does not match,
                 # this token will definitely not participate
                 # in recursive tree expansion calls
                 tokenized_candidates_to_expand.pop(idx)
-            
 
         # Return the parent node with its children expanded
         return parent
 
-    
-    def _build_tree(self,
-                    tokenized_context: List[torch.Tensor]
-                    ) -> Tuple[Node, torch.Tensor]:
+    def _build_tree(
+            self, tokenized_context: List[torch.Tensor]
+    ) -> Tuple[Node, torch.Tensor]:
         """
         Builds the entire tree for a given prompt using 
         the tokenized context.
@@ -108,33 +103,29 @@ class SubstringAsyncEngine:
             Tuple[Node, torch.Tensor]: The root node of
                 the tree and the tokenized prompt.
         """
-        
+
         s = time.time()
-        
+
         # Initialize the root node and tokenize the prompt
         root = Node(-1, None, 0)
         # Expand the tree from the root node to the
         # specified height, excluding special tokens
         special_tokens_ids = self.tokenizer.all_special_ids
         root = self._expand_tree(root,
-                           tokenized_context,
-                           len(tokenized_context[0]),
-                           special_ids = special_tokens_ids)
+                                 tokenized_context,
+                                 len(tokenized_context[0]),
+                                 special_ids=special_tokens_ids)
         # Set the cumulative log probability of the root node to 0
         root.cum_log_probability = 0
 
         if self.mode:
             print(f"{self.for_loop_counter} - self.for_loop_counter")
             print(f"build tree for first tokens: {time.time() - s}")
-        
+
         # Return the root node and the tokenized prompt
         return root
 
-
-    def _candidate_sequences(self,
-                             context,
-                             max_token_length,
-                             prompt=''):
+    def _candidate_sequences(self, context, max_token_length, prompt=''):
         """
         Generates a set of candidate sequences 
         from the given context by considering all
@@ -158,42 +149,41 @@ class SubstringAsyncEngine:
                 starting with the provided prompt.
         """
         s = time.time()
-        
-        # Calculate the restriction based on the 
+
+        # Calculate the restriction based on the
         # length of the text and the maximum token
         # length
-        restriction = min(len(context) + 1,
-                          max_token_length)
+        restriction = min(len(context) + 1, max_token_length)
         # Initialize an empty set to store unique
         # substring candidates
         substring_candidates = set()
 
         if self.is_fast:
-            # if we want a narrow candidate space 
-            # as a sub-string response, but faster 
+            # if we want a narrow candidate space
+            # as a sub-string response, but faster
             # execution time
 
             substring_context = context.split(' ')
             word_lengths = [len(word) for word in substring_context]
-            avg_length = (sum(word_lengths) + len(word_lengths)) / len(word_lengths)
+            avg_length = (sum(word_lengths) +
+                          len(word_lengths)) / len(word_lengths)
             step_size = int(restriction // avg_length) + 1
 
-            # Iterate over the text to generate all possible 
+            # Iterate over the text to generate all possible
             # substrings within the restriction
             for i in range(len(substring_context)):
-                loop_boundary = min(len(substring_context) + 1,
-                                    i + 1 + step_size)
+                loop_boundary = min(
+                    len(substring_context) + 1, i + 1 + step_size)
                 for j in range(i + 1, loop_boundary):
                     candidate = " ".join(substring_context[i:j])
                     substring_candidates.add(candidate)
         else:
-            # all possible character-by-character context splits 
+            # all possible character-by-character context splits
             for i in range(len(context)):
-                loop_boundary = min(len(context) + 1,
-                                    i + 1 + restriction)
-                for j in range(i+1, loop_boundary):
+                loop_boundary = min(len(context) + 1, i + 1 + restriction)
+                for j in range(i + 1, loop_boundary):
                     substring_candidates.add(context[i:j])
-        
+
         # Sort the set of substring candidates
         # for reproducibility
         substring_candidates = sorted(substring_candidates)
@@ -202,15 +192,14 @@ class SubstringAsyncEngine:
         sequences = [prompt + candidate for candidate in substring_candidates]
 
         if self.mode:
-            print(f"get candidates: last 2 tokens + all substring candidates {time.time() - s}")
+            print(
+                f"get candidates: last 2 tokens + all substring candidates {time.time() - s}"
+            )
             sequences
-            
+
         return sequences
 
-    
-    async def _compute_logprob(self,
-                               common_part, 
-                               nodes):
+    async def _compute_logprob(self, common_part, nodes):
         """
         Computes the cumulative log probabilities
         for each node in the tree structure,
@@ -236,16 +225,15 @@ class SubstringAsyncEngine:
                 updating their cumulative log probabilities.
     
         """
-        def process_log_probs(prompt_tokens,
-                              generated_tokens, 
-                              logits):
+
+        def process_log_probs(prompt_tokens, generated_tokens, logits):
             log_probs = F.log_softmax(logits, dim=0)
             log_probs_mapping[tuple(prompt_tokens)] = log_probs
             return logits
 
         s = time.time()
-        
-        # Calculate the number of tokens in the 
+
+        # Calculate the number of tokens in the
         # common part of the text
         inference_counter = 0
         log_probs_mapping = {}
@@ -257,7 +245,8 @@ class SubstringAsyncEngine:
                                          logits_processors=[process_log_probs])
 
         # get all nodes without log probability computed yet
-        nodes_map = set(node for node in nodes if node.cum_log_probability is None)
+        nodes_map = set(node for node in nodes
+                        if node.cum_log_probability is None)
 
         # get all parents of nodes from nodes_map whose log
         # probability has not been calculated yet
@@ -275,34 +264,33 @@ class SubstringAsyncEngine:
         if not nodes_map:
             # if all log probs already computed
             return
-        
+
         s1 = time.time()
 
-        common_part_encoded = self.tokenizer.encode(common_part) 
+        common_part_encoded = self.tokenizer.encode(common_part)
         inputs_map = {}
         for node in nodes_map:
-            inp = common_part_encoded + node.parent_node.token_sequence.tolist()
-            # we save nodes with the same 
+            inp = common_part_encoded + node.parent_node.token_sequence.tolist(
+            )
+            # we save nodes with the same
             # parent node, because they will
-            # have the same input prompt for 
+            # have the same input prompt for
             # the lmm
             inputs_map.setdefault(tuple(inp), []).append(node)
-        
+
         if self.mode:
             print(f"\ncreate inputs map: {time.time() - s1}\n")
-            
-         
-        s2 = time.time()    
+
+        s2 = time.time()
         for input_prompt in inputs_map:
             request_id = random_uuid()
             # Feed the input into the model to get the logits
             res = (self.llm.generate(request_id=request_id,
-                                    prompt=None,
-                                    prompt_token_ids=list(input_prompt),
-                                    sampling_params=sampling_params)
-                  )
+                                     prompt=None,
+                                     prompt_token_ids=list(input_prompt),
+                                     sampling_params=sampling_params))
             inference_counter += 1
-            
+
             # async vllm engine returns AsyncIterator
             # merge each res into one stream
             if not results:
@@ -321,20 +309,20 @@ class SubstringAsyncEngine:
             print(f"inference_counter/time: {inference_counter/(s2e - s2)}")
 
         s3 = time.time()
-        
+
         for input_prompt in inputs_map:
             for node in inputs_map[input_prompt]:
                 # save logprobs of concrete tokens
                 # (we saved logprobs for all tokens
                 #  during `.generate()` call)
-                node_output_map[node] = log_probs_mapping[input_prompt][node.token_id]
+                node_output_map[node] = log_probs_mapping[input_prompt][
+                    node.token_id]
 
         if self.mode:
             print(f"save log probs: {time.time() - s3}")
-        
-                
+
         # Iterate over the nodes again to
-        # update their 
+        # update their
         # cumulative log probabilities
         for node in node_output_map:
             node_log_prob = node_output_map[node]
@@ -343,10 +331,10 @@ class SubstringAsyncEngine:
                 print("children")
                 print(node.token_id)
                 print(node_log_prob)
-            
+
             if node.parent_node.cum_log_probability is None:
-                # for parent nodes without stored logprobability 
-                
+                # for parent nodes without stored logprobability
+
                 parents_sequence_without_logprob = []
                 parent_tmp = node.parent_node
                 while parent_tmp.cum_log_probability is None:
@@ -361,22 +349,23 @@ class SubstringAsyncEngine:
                                                 .parent_node \
                                                 .token_sequence \
                                                 .tolist()
-                    parent_logprob = log_probs_mapping[tuple(key)][parent_tmp.token_id]
+                    parent_logprob = log_probs_mapping[tuple(key)][
+                        parent_tmp.token_id]
                     parents_log_probs.append(parent_logprob)
-            
+
                     if self.mode:
                         print("parent without logprob: ")
                         print(parent_tmp.token_id)
                         print(parents_log_probs[-1])
 
-
                 # Calculate the cumulative log probability for each parent node
-                number_of_parents_without_logbrob = len(parents_sequence_without_logprob)
-                for n_id in range(number_of_parents_without_logbrob - 1, -1, -1):
+                number_of_parents_without_logbrob = len(
+                    parents_sequence_without_logprob)
+                for n_id in range(number_of_parents_without_logbrob - 1, -1,
+                                  -1):
                     parents_sequence_without_logprob[n_id].cum_log_probability = \
                     (parents_log_probs[n_id] + parents_sequence_without_logprob[n_id]
                                                .parent_node.cum_log_probability)
-                
 
             # Update the node's cumulative log probability
             node.cum_log_probability = node.parent_node.cum_log_probability + \
@@ -386,18 +375,14 @@ class SubstringAsyncEngine:
             print("log prob nodes: ")
             print(len(nodes_map))
             for node in nodes_map:
-                print(f"'{self.tokenizer.decode(node.token_sequence)}';
-                        '{node.cum_log_probability}';
+                print(f"'{self.tokenizer.decode(node.token_sequence)}' \
+                        '{node.cum_log_probability}' \
                         '{node.depth}'")
-            
+
             print()
             print(f"compute log_probs call {time.time() - s}")
-            
-            
-    
-    async def _get_topk_nodes(self,
-                              nodes,
-                              k):
+
+    async def _get_topk_nodes(self, nodes, k):
         """
         Selects the top `k` nodes from a given 
         list of nodes based on their cumulative
@@ -418,20 +403,21 @@ class SubstringAsyncEngine:
         """
         s = time.time()
         # Calculate the normalized scores for each node
-        scores = torch.tensor([node.cum_log_probability/node.depth for node in nodes])
+        scores = torch.tensor(
+            [node.cum_log_probability / node.depth for node in nodes])
         # Determine the indices of the top k scores
-        top_k_indices = torch.topk(scores, k=k, largest=True, sorted=True).indices
-        
+        top_k_indices = torch.topk(scores, k=k, largest=True,
+                                   sorted=True).indices
+
         if self.mode:
             print(f"get top k nodes call: {time.time() - s}")
         # Select the top k nodes using the indices
         return [nodes[i] for i in top_k_indices]
 
-
     def _candidate_sequences_exp(self,
-                                 context, 
-                                 chosen_options, 
-                                 max_candidate_length, 
+                                 context,
+                                 chosen_options,
+                                 max_candidate_length,
                                  prompt=''):
         """
         
@@ -452,52 +438,60 @@ class SubstringAsyncEngine:
                 and prefixed with the provided prompt.
         """
         s = time.time()
-        # Calculate the restriction based on the 
+        # Calculate the restriction based on the
         # length of the text and the maximum candidate length
         restriction = min(len(context) + 1, max_candidate_length)
         # Initialize an empty set to store unique substring candidates
         substring_candidates = set()
-    
-        # Iterate over the text to generate all 
+
+        # Iterate over the text to generate all
         # possible substrings within the restriction
 
         if self.is_fast:
             substring_context = context.split(' ')
             word_lengths = [len(word) for word in substring_context]
-            avg_length = (sum(word_lengths) + len(word_lengths))/len(word_lengths)
+            avg_length = (sum(word_lengths) +
+                          len(word_lengths)) / len(word_lengths)
             step_size = int(restriction // avg_length) + 1
 
             for i in range(len(substring_context)):
-                for j in range(i+1, min(len(substring_context)+1, i+1+step_size)):
+                for j in range(
+                        i + 1,
+                        min(len(substring_context) + 1, i + 1 + step_size)):
                     candidate = prompt + " ".join(substring_context[i:j])
-                    tokenized_candidate = self.tokenizer.encode(candidate,
-                                                        return_tensors="pt",
-                                                        add_special_tokens=False)[0]
+                    tokenized_candidate = self.tokenizer.encode(
+                        candidate,
+                        return_tensors="pt",
+                        add_special_tokens=False)[0]
                     # Check if the candidate starts with one of the chosen options
-                    if any(torch.equal(tokenized_candidate[:len(option)], option) 
-                           for option in chosen_options):
+                    if any(
+                            torch.equal(tokenized_candidate[:len(option)],
+                                        option) for option in chosen_options):
                         substring_candidates.add(candidate)
         else:
             for i in range(len(context)):
-                for j in range(i+1, i+1+restriction):
+                for j in range(i + 1, i + 1 + restriction):
                     candidate = prompt + context[i:j]
-                    tokenized_candidate = self.tokenizer.encode(candidate,
-                                                        return_tensors="pt",
-                                                        add_special_tokens=False)[0]
+                    tokenized_candidate = self.tokenizer.encode(
+                        candidate,
+                        return_tensors="pt",
+                        add_special_tokens=False)[0]
                     # Check if the candidate starts with one of the chosen options
-                    if any(torch.equal(tokenized_candidate[:len(option)], option) 
-                           for option in chosen_options):
+                    if any(
+                            torch.equal(tokenized_candidate[:len(option)],
+                                        option) for option in chosen_options):
                         substring_candidates.add(candidate)
-        
+
         # Sort the set of substring candidates for reproducibility
         sequences = sorted(list(substring_candidates))
 
         if self.mode:
-            print(f"get expanded candidates starts with top k first tokens: {time.time() - s}")
-            
+            print(
+                f"get expanded candidates starts with top k first tokens: {time.time() - s}"
+            )
+
         return sequences
 
-    
     def _get_nodes_seq_before_branch(self, node):
         """    
         Args:
@@ -532,17 +526,13 @@ class SubstringAsyncEngine:
                 node = children[0]
                 nodes_sequence.append(node)
             else:
-                # If the node has more than one child, 
+                # If the node has more than one child,
                 # it's a branching point
                 break
         # Return the node just before the branching point
         return nodes_sequence
 
-
-    async def _iteration(self, 
-                         working_list, 
-                         common_part, 
-                         k):
+    async def _iteration(self, working_list, common_part, k):
         """
         Performs an iteration of the sequence
         generation process by computing the 
@@ -570,15 +560,13 @@ class SubstringAsyncEngine:
         """
         # Add children to wotking list for every node in it
         working_list = self._update_working_list_with_children(working_list)
-        
+
         # Compute the cumulative log probabilities for each node in the working list
         await self._compute_logprob(common_part, working_list)
         # Select the top k nodes from the working list based on their cumulative log probabilities
         return await self._get_topk_nodes(working_list, k)
 
-
-    def _update_working_list_with_children(self,
-                                           working_list):
+    def _update_working_list_with_children(self, working_list):
         """
         Updates the working list of nodes by adding 
         the children of each node in the list,
@@ -602,15 +590,16 @@ class SubstringAsyncEngine:
                     working_list.extend(candidate_seq_to_add)
 
         if self.mode:
-            print(f"add children sequences before found branch into working list: {time.time() - s}")
+            print(
+                f"add children sequences before found branch into working list: {time.time() - s}"
+            )
         return working_list
-    
-    
-    async def substring(self, 
-                        prompt, 
-                        context, 
-                        k, 
-                        max_substring_length, 
+
+    async def substring(self,
+                        prompt,
+                        context,
+                        k,
+                        max_substring_length,
                         return_full_text=False):
         """
         Generates and evaluates candidate sequences 
@@ -635,10 +624,11 @@ class SubstringAsyncEngine:
                 root node of the tree.
         """
         # Tokenize the prompt and extract the last part and the common part
-        tokenized_prompt = self.tokenizer(prompt,
-                                    return_tensors="pt",
-                                    padding=True,
-                                    add_special_tokens=False)['input_ids']
+        tokenized_prompt = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            padding=True,
+            add_special_tokens=False)['input_ids']
         last_part = self.tokenizer.decode(tokenized_prompt[0, -2:])
         common_part = self.tokenizer.decode(tokenized_prompt[0, :-2])
 
@@ -646,96 +636,92 @@ class SubstringAsyncEngine:
             if return_full_text:
                 return prompt + context
             return context
-        
+
         # Generate candidate sequences from the context
-        substring_candidates = self._candidate_sequences(context,
-                                                         self.max_token_len,
-                                                         last_part)
-        
-        tokenized_s_cand = list(self.tokenizer(substring_candidates,
-                                     return_tensors="pt",
-                                     padding=True,
-                                     add_special_tokens=False)['input_ids'])
-        
+        substring_candidates = self._candidate_sequences(
+            context, self.max_token_len, last_part)
+
+        tokenized_s_cand = list(
+            self.tokenizer(substring_candidates,
+                           return_tensors="pt",
+                           padding=True,
+                           add_special_tokens=False)['input_ids'])
+
         # Build the tree structure from the tokenized candidate sequences
         initial_root = self._build_tree(tokenized_s_cand)
 
         # Expand the tree from the root node
-        node_before_branch = self._get_nodes_seq_before_branch(initial_root)[-1]
+        node_before_branch = self._get_nodes_seq_before_branch(
+            initial_root)[-1]
         first_branch_children = node_before_branch.children
-        
+
         if not first_branch_children:
             first_branch_children = [node_before_branch]
-            
+
         # Last token of the prompt can be changed
-        # Therefore, we have to capture not tokens before first 
-        # branch, but all its children after branch    
-        
+        # Therefore, we have to capture not tokens before first
+        # branch, but all its children after branch
+
         working_list = []
         for node in first_branch_children:
             wl_len = len(working_list)
-            
+
             for c in node.children:
                 candidate_seq_to_add = self._get_nodes_seq_before_branch(c)
                 if candidate_seq_to_add[-1] not in working_list:
-                    working_list.extend(candidate_seq_to_add)  
-                    
+                    working_list.extend(candidate_seq_to_add)
+
             if wl_len == len(working_list):
                 working_list.append(node)
-                   
+
         await self._compute_logprob(common_part, working_list)
         working_list = await self._get_topk_nodes(working_list, k)
-    
+
         # Generate expanded candidate sequences based
         # on the chosen candidates
-        chosen_candidates = list(map(lambda x: x.token_sequence,
-                                     working_list))
+        chosen_candidates = list(map(lambda x: x.token_sequence, working_list))
 
         if self.mode:
             print("chosen_candidates for explansion: ")
             for c in chosen_candidates:
                 print(self.tokenizer.decode(c))
             print()
-        
-        expanded_candidates = self._candidate_sequences_exp(context, 
-                                                            chosen_candidates,
-                                                            max_substring_length,
-                                                            last_part)
-        
-        tokenized_expanded_candidates = list(self.tokenizer(expanded_candidates,
-                                                  return_tensors="pt",
-                                                  padding=True,
-                                                  add_special_tokens=False)['input_ids'])
-    
+
+        expanded_candidates = self._candidate_sequences_exp(
+            context, chosen_candidates, max_substring_length, last_part)
+
+        tokenized_expanded_candidates = list(
+            self.tokenizer(expanded_candidates,
+                           return_tensors="pt",
+                           padding=True,
+                           add_special_tokens=False)['input_ids'])
+
         # Update the working list with children nodes
         working_list[0].parent_node.children = working_list
-    
+
         # Expand the tree with the expanded candidate sequences
         for node in working_list:
             self._expand_tree(node,
-                        tokenized_expanded_candidates,
-                        len(tokenized_expanded_candidates[0]),
-                        position = node.depth,
-                        special_ids=self.tokenizer.all_special_ids)
-    
-        # Iteratively refine the set of candidate sequences based 
+                              tokenized_expanded_candidates,
+                              len(tokenized_expanded_candidates[0]),
+                              position=node.depth,
+                              special_ids=self.tokenizer.all_special_ids)
+
+        # Iteratively refine the set of candidate sequences based
         # on their likelihood
         while True:
             prev_w_l = deepcopy(working_list)
-            working_list = await self._iteration(working_list,
-                                                 common_part, k)
+            working_list = await self._iteration(working_list, common_part, k)
             if prev_w_l == working_list:
                 break
-    
+
         res_text = []
         for node in working_list:
             substirng_choice = self.tokenizer.decode(node.token_sequence)
-            
+
             if return_full_text:
                 res_text.append(common_part + substirng_choice)
             else:
                 res_text.append(substirng_choice[len(last_part):])
-        
+
         return res_text, working_list, initial_root
-    
-    

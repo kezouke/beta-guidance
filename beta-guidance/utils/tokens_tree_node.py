@@ -1,5 +1,6 @@
 import torch
 
+
 class Node:
     """
     A class representing a node in a tree structure. Each node contains 
@@ -19,10 +20,7 @@ class Node:
             the sequence of tokens from the root to this node.
     """
 
-    def __init__(self,
-                 token_id: int,
-                 parent_node: 'Node',
-                 depth: int):
+    def __init__(self, token_id: int, parent_node: 'Node', depth: int):
         """
         Initializes a new Node instance.
 
@@ -41,15 +39,13 @@ class Node:
         self.depth = depth
         self.cum_log_probability = None
 
-        # Initialize the token_sequence based on the 
+        # Initialize the token_sequence based on the
         # parent node's token_sequence and the current
         # token_id
         if depth:
-            token_id_tensor = torch.tensor([self.token_id],
-                                            dtype=torch.long)
+            token_id_tensor = torch.tensor([self.token_id], dtype=torch.long)
             parent_sequence = self.parent_node.token_sequence
-            self.token_sequence = torch.cat((parent_sequence,
-                                             token_id_tensor))
+            self.token_sequence = torch.cat((parent_sequence, token_id_tensor))
         else:
             self.token_sequence = torch.tensor([], dtype=torch.long)
 
@@ -84,5 +80,3 @@ class Node:
         may change.
         """
         return hash(tuple(self.token_sequence.tolist()))
-        
-        

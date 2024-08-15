@@ -6,11 +6,7 @@ from vllm.utils import random_uuid
 from .utils.tokens_tree_node import Node
 
 
-def vllm_compute_logprob(common_part,
-                         nodes,
-                         llm,
-                         tokenizer,
-                         mode):
+def vllm_compute_logprob(common_part, nodes, llm, tokenizer, mode):
     """
     When vllm llm model is used:
 
@@ -68,16 +64,15 @@ def vllm_compute_logprob(common_part,
     probability reflects the likelihood of the sequence of 
     tokens leading up to it.
     """
-    def process_log_probs(prompt_tokens,
-                          generated_tokens, 
-                          logits):
+
+    def process_log_probs(prompt_tokens, generated_tokens, logits):
         log_probs = F.log_softmax(logits, dim=0)
         log_probs_mapping[tuple(prompt_tokens)] = log_probs
         return logits
 
     s = time.time()
-    
-    # Calculate the number of tokens in the 
+
+    # Calculate the number of tokens in the
     # common part of the text
     inference_counter = 0
     log_probs_mapping = {}
@@ -107,24 +102,23 @@ def vllm_compute_logprob(common_part,
     if not nodes_map:
         # if all log probs already computed
         return
-    
+
     s1 = time.time()
 
-    common_part_encoded = tokenizer.encode(common_part) 
+    common_part_encoded = tokenizer.encode(common_part)
     inputs_map = {}
     for node in nodes_map:
         inp = common_part_encoded + node.parent_node.token_sequence.tolist()
-        # we save nodes with the same 
+        # we save nodes with the same
         # parent node, because they will
-        # have the same input prompt for 
+        # have the same input prompt for
         # the lmm
         inputs_map.setdefault(tuple(inp), []).append(node)
-    
+
     if mode:
         print(f"\ncreate inputs map: {time.time() - s1}\n")
-        
-        
-    s2 = time.time()    
+
+    s2 = time.time()
     for input_prompt in inputs_map:
         # Feed the input into the model to get the logits
         llm.generate(prompt=None,
@@ -142,20 +136,20 @@ def vllm_compute_logprob(common_part,
         print(f"inference_counter/time: {inference_counter/(s2e - s2)}")
 
     s3 = time.time()
-    
+
     for input_prompt in inputs_map:
         for node in inputs_map[input_prompt]:
             # save logprobs of concrete tokens
             # (we saved logprobs for all tokens
             #  during `.generate()` call)
-            node_output_map[node] = log_probs_mapping[input_prompt][node.token_id]
+            node_output_map[node] = log_probs_mapping[input_prompt][
+                node.token_id]
 
     if mode:
         print(f"save log probs: {time.time() - s3}")
-    
-            
+
     # Iterate over the nodes again to
-    # update their 
+    # update their
     # cumulative log probabilities
     for node in node_output_map:
         node_log_prob = node_output_map[node]
@@ -164,10 +158,10 @@ def vllm_compute_logprob(common_part,
             print("children")
             print(node.token_id)
             print(node_log_prob)
-        
+
         if node.parent_node.cum_log_probability is None:
-            # for parent nodes without stored logprobability 
-            
+            # for parent nodes without stored logprobability
+
             parents_sequence_without_logprob = []
             parent_tmp = node.parent_node
             while parent_tmp.cum_log_probability is None:
@@ -182,22 +176,22 @@ def vllm_compute_logprob(common_part,
                                             .parent_node \
                                             .token_sequence \
                                             .tolist()
-                parent_logprob = log_probs_mapping[tuple(key)][parent_tmp.token_id]
+                parent_logprob = log_probs_mapping[tuple(key)][
+                    parent_tmp.token_id]
                 parents_log_probs.append(parent_logprob)
-        
+
                 if mode:
                     print("parent without logprob: ")
                     print(parent_tmp.token_id)
                     print(parents_log_probs[-1])
 
-
             # Calculate the cumulative log probability for each parent node
-            number_of_parents_without_logbrob = len(parents_sequence_without_logprob)
+            number_of_parents_without_logbrob = len(
+                parents_sequence_without_logprob)
             for n_id in range(number_of_parents_without_logbrob - 1, -1, -1):
                 parents_sequence_without_logprob[n_id].cum_log_probability = \
                 (parents_log_probs[n_id] + parents_sequence_without_logprob[n_id]
                                             .parent_node.cum_log_probability)
-            
 
         # Update the node's cumulative log probability
         node.cum_log_probability = node.parent_node.cum_log_probability + \
@@ -207,20 +201,14 @@ def vllm_compute_logprob(common_part,
         print("log prob nodes: ")
         print(len(nodes_map))
         for node in nodes_map:
-            print(f"'{tokenizer.decode(node.token_sequence)}';
-                    '{node.cum_log_probability}';
+            print(f"'{tokenizer.decode(node.token_sequence)}' \
+                    '{node.cum_log_probability}' \
                     '{node.depth}'")
-        
         print()
         print(f"compute log_probs call {time.time() - s}")
 
 
-
-def hf_compute_logprob(common_part,
-                       nodes,
-                       model,
-                       tokenizer,
-                       mode):
+def hf_compute_logprob(common_part, nodes, model, tokenizer, mode):
     """
     When Hugging Face llm model is used:
 
@@ -302,7 +290,8 @@ def hf_compute_logprob(common_part,
             # Construct the input sequence for the model
             # we get tokens of the parent, since we need only
             # them for getting log probability for current considered node token
-            inp = common_part + tokenizer.decode(node.parent_node.token_sequence)
+            inp = common_part + tokenizer.decode(
+                node.parent_node.token_sequence)
             # Map the node to its input sequence
             node_mapping.setdefault(inp, []).append(node)
 
@@ -312,9 +301,9 @@ def hf_compute_logprob(common_part,
 
     # Tokenize the input batch
     tokenized_model_input = tokenizer(list(node_mapping.keys()),
-                                           return_tensors="pt",
-                                           padding=True,
-                                           add_special_tokens=True)
+                                      return_tensors="pt",
+                                      padding=True,
+                                      add_special_tokens=True)
 
     # Feed the tokenized input into the model to get the logits
     with torch.no_grad():
@@ -343,21 +332,25 @@ def hf_compute_logprob(common_part,
             i = 2
             while parent_tmp.cum_log_probability is None:
                 parents_sequence_without_logprob.append(parent_tmp)
-                parents_log_probs.append(log_probs[idx, first_padding - i, tokens[first_padding - i + 1]])
+                parents_log_probs.append(log_probs[idx, first_padding - i,
+                                                   tokens[first_padding - i +
+                                                          1]])
                 i += 1
                 parent_tmp = parent_tmp.parent_node
 
             # Calculate the cumulative log probability for each parent node
-            number_of_parents_without_logbrob = len(parents_sequence_without_logprob)
+            number_of_parents_without_logbrob = len(
+                parents_sequence_without_logprob)
             for n_id in range(number_of_parents_without_logbrob - 1, -1, -1):
-                (parents_sequence_without_logprob[n_id]
-                    .cum_log_probability) = (parents_log_probs[n_id] +
-                                            parents_sequence_without_logprob[n_id]
-                                            .parent_node.cum_log_probability)
+                (parents_sequence_without_logprob[n_id].cum_log_probability
+                 ) = (parents_log_probs[n_id] +
+                      parents_sequence_without_logprob[n_id].parent_node.
+                      cum_log_probability)
 
             # Update the node's cumulative log probability
             log_probs_mapping[node] = node.parent_node.cum_log_probability
-            node.cum_log_probability = log_probs_mapping[node] + log_probs[idx, first_padding - 1, node.token_id]
+            node.cum_log_probability = log_probs_mapping[node] + log_probs[
+                idx, first_padding - 1, node.token_id]
 
     if mode:
         print(f"compute log_probs call {time.time() - s}")
