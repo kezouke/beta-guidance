@@ -66,3 +66,11 @@ output = guidance_system.select(texts, choices_list)
 
 # Output is ['car', 'ladesh']
 ```
+
+### Compatibility
+BetaGuidance is designed to be flexible and works seamlessly with various LLM frameworks and instances, including:
+
+- Hugging Face Model Interface: Integrate with models from the Hugging Face ecosystem to leverage a wide variety of pre-trained transformers for your constrained generation tasks.
+- VLLM Library:
+  - Use BetaGuidance with the VLLM library for efficient and scalable inference, enabling high-performance generation with large models.
+  - AsyncEngine Instances: Employ BetaGuidance in asynchronous environments using AsyncEngine instances, allowing for non-blocking operations and efficient resource management during constrained generation.
